@@ -125,7 +125,7 @@ cmd_range() {
     # content lines carry embedded line numbers: "     N  text" — filter by N
     _cache_body "$(_cache_path "$ref")" | \
       awk -v s="$start" -v e="$end" \
-        'match($0,/^ *([0-9]+)  /,a){n=int(a[1]); if(n>=s && n<=e) print}'
+        'match($0,/^ *[0-9]+[[:space:]]+/){n=int(substr($0,RSTART,RLENGTH)); if(n>=s && n<=e) print}'
     return
   fi
   _mcp "$(jq -nc --arg r "$ref" --argjson o "$start" --argjson l "$limit" \
@@ -139,7 +139,7 @@ cmd_outline() {
     grep 'Size:' "$path" || true
     # Extract heading lines from cached numbered content
     _cache_body "$path" | \
-      awk 'match($0,/^ *([0-9]+)  (#+|=+)/,a){print a[1]": "substr($0,RSTART+RLENGTH)}'
+      awk 'match($0,/^ *[0-9]+[[:space:]]+/){n=int(substr($0,RSTART,RLENGTH)); rest=substr($0,RSTART+RLENGTH); if(rest~/^[#=]/) print n": "rest}'
     return
   fi
   _mcp "$(jq -nc --arg r "$ref" \
