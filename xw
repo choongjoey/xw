@@ -26,13 +26,15 @@ fi
 # ---------------------------------------------------------------------------
 
 _urlencode() {
-  python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[-1]))" -- "$1"
+  python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[-1],safe=''))" -- "$1"
 }
 
 # Space.Sub.Page  →  /spaces/Space/spaces/Sub/pages/Page
+# Strips leading wiki: prefix (e.g. "aster:Space.Page" → "Space.Page") before processing.
 _ref_to_url() {
+  local ref="${1#*:}"   # strip wiki: prefix if present
   local IFS='.'
-  read -ra _p <<< "$1"
+  read -ra _p <<< "$ref"
   local n=${#_p[@]} url="" i
   for ((i=0; i<n-1; i++)); do url+="/spaces/$(_urlencode "${_p[$i]}")"; done
   url+="/pages/$(_urlencode "${_p[$((n-1))]}")"
@@ -67,6 +69,46 @@ _restq() { local p="$1"; shift; curl -s "${_AUTH[@]}" -G "$REST_BASE$p" "$@" -H 
 # Parse "Size: N lines · ..." → N
 _size_lines() { awk '/^Size:/{print $2; exit}'; }
 
+# Fetch XWiki's CSRF form token (some instances require it on form POST/PUT).
+# Returns the value of the XWiki-Form-Token response header, or empty.
+_form_token() {
+  curl -s "${_AUTH[@]}" -I "$REST_BASE" \
+    | awk 'BEGIN{IGNORECASE=1} /^XWiki-Form-Token:/{sub(/\r$/,""); print $2; exit}'
+}
+
+# _restwrite METHOD PATH CONTENT_TYPE BODY — write transport.
+# Sends BODY to REST_BASE$PATH; splits trailing HTTP status from the response.
+# On non-2xx: prints body + status to stderr and exits 1. On success: echoes body.
+_restwrite() {
+  local method="$1" path="$2" ctype="$3" body="$4"
+  local hdr=() token
+  token=$(_form_token)
+  [[ -n "$token" ]] && hdr=(-H "XWiki-Form-Token: $token")
+  local resp status
+  resp=$(curl -s "${_AUTH[@]}" -X "$method" "$REST_BASE$path" \
+    -H "Content-Type: $ctype" -H "Accept: application/json" \
+    "${hdr[@]+"${hdr[@]}"}" -w $'\n%{http_code}' --data-binary "$body")
+  status="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  if [[ "$status" != 2* ]]; then
+    echo "xw: $method $path -> HTTP $status" >&2
+    [[ -n "$body" ]] && echo "$body" >&2
+    exit 1
+  fi
+  printf '%s' "$body"
+}
+
+# _page_exists REF — true iff GET on the page resource returns 2xx.
+_page_exists() {
+  local code
+  code=$(curl -s "${_AUTH[@]}" -o /dev/null -w '%{http_code}' \
+    "$REST_BASE$(_ref_to_url "$1")" -H "Accept: application/json")
+  [[ "$code" == 2* ]]
+}
+
+# _cache_evict REF — drop any cached copy so a stale read can't survive a write.
+_cache_evict() { rm -f "$(_cache_path "$1")"; }
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -79,15 +121,38 @@ cmd_ls() {
   else
     local wiki="$XWIKI_WIKI"
     _rest "/spaces" | jq -r --arg w "$wiki" --arg s "$space" \
-      '.spaces[] | select(.id | test("^"+$w+":"+$s+"\\.[^.]+$")) | .name'
+      '.spaces[] | select(.id | test("^"+$w+":"+$s+"\\.[^.]+$")) | (.id | split(":")[1]) + ".WebHome"'
   fi
 }
 
 cmd_cat() {
   local ref="$1"
-  if _cache_hit "$ref"; then cat "$(_cache_path "$ref")"; return; fi
-  _mcp "$(jq -nc --arg r "$ref" \
-    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_document","arguments":{"reference":$r}}}')"
+  if _cache_hit "$ref"; then
+    cat "$(_cache_path "$ref")"
+  else
+    _mcp "$(jq -nc --arg r "$ref" \
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_document","arguments":{"reference":$r}}}')"
+  fi
+  # Append XObject properties (AWM app data) from REST.
+  # If XWIKI_OBJECT_CLASS is set, show only that class; otherwise skip internal XWiki.* objects.
+  local base obj_resp obj_lines
+  base="$(_ref_to_url "$ref")"
+  obj_resp=$(_rest "$base/objects" 2>/dev/null)
+  if [[ -n "$XWIKI_OBJECT_CLASS" ]]; then
+    obj_lines=$(printf '%s' "$obj_resp" | jq -r --arg c "$XWIKI_OBJECT_CLASS" \
+      '.objectSummaries[]? | select(.className == $c) | "\(.className)\t\(.number)"' 2>/dev/null)
+  else
+    obj_lines=$(printf '%s' "$obj_resp" | jq -r \
+      '.objectSummaries[]? | select(.className | startswith("XWiki.") | not) | "\(.className)\t\(.number)"' 2>/dev/null)
+  fi
+  if [[ -n "$obj_lines" ]]; then
+    echo ""
+    while IFS=$'\t' read -r class number; do
+      echo "--- $class[$number] ---"
+      _rest "$base/objects/$(_urlencode "$class")/$number" \
+        | jq -r '.properties[]? | select(.value != null and .value != "") | "\(.name)=\(.value)"' 2>/dev/null
+    done <<< "$obj_lines"
+  fi
 }
 
 cmd_head() {
@@ -316,6 +381,108 @@ cmd_man() {
   fi
 }
 
+cmd_put() {
+  local ref="${1:-}"; shift || true
+  if [[ -z "$ref" ]]; then echo "xw put: usage: put <ref> [--title T] [--syntax S] (--content C | --file F | -)" >&2; exit 1; fi
+  local title="" syntax="xwiki/2.1" content="" have_content=false use_stdin=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title)   title="$2";   shift 2 ;;
+      --syntax)  syntax="$2";  shift 2 ;;
+      --content) content="$2"; have_content=true; shift 2 ;;
+      --file)    content="$(cat "$2")"; have_content=true; shift 2 ;;
+      -)         use_stdin=true; shift ;;
+      *) echo "xw put: unknown flag $1" >&2; exit 1 ;;
+    esac
+  done
+  if ! $have_content; then
+    if $use_stdin || [[ ! -t 0 ]]; then
+      content="$(cat)"
+    else
+      echo "xw put: no content — pass --content, --file, or pipe via '-'" >&2; exit 1
+    fi
+  fi
+  local body
+  body=$(jq -nc --arg t "$title" --arg s "$syntax" --arg c "$content" \
+    '{syntax:$s,content:$c} | if $t!="" then .+{title:$t} else . end')
+  _restwrite PUT "$(_ref_to_url "$ref")" application/json "$body" >/dev/null
+  _cache_evict "$ref"
+  echo "updated: $ref" >&2
+}
+
+cmd_obj() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    ls)
+      local ref="${1:-}"
+      [[ -z "$ref" ]] && { echo "xw obj ls: usage: obj ls <ref>" >&2; exit 1; }
+      _rest "$(_ref_to_url "$ref")/objects" \
+        | jq -r '.objectSummaries[] | "\(.className)[\(.number)]"'
+      ;;
+    get)
+      local ref="${1:-}"; shift || true
+      [[ -z "$ref" ]] && { echo "xw obj get: usage: obj get <ref> [--class C] [--number N]" >&2; exit 1; }
+      local class="$XWIKI_OBJECT_CLASS" number=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --class)  class="$2";  shift 2 ;;
+          --number) number="$2"; shift 2 ;;
+          *) echo "xw obj get: unknown flag $1" >&2; exit 1 ;;
+        esac
+      done
+      [[ -z "$class" ]] && { echo "xw obj get: set --class or XWIKI_OBJECT_CLASS (e.g. MySpace.Code.MyClass)" >&2; exit 1; }
+      _rest "$(_ref_to_url "$ref")/objects/$(_urlencode "$class")/$number" \
+        | jq -r '.properties[] | "\(.name)=\(.value)"'
+      ;;
+    set)
+      local ref="${1:-}"; shift || true
+      [[ -z "$ref" ]] && { echo "xw obj set: usage: obj set <ref> [--class C] [--number N] key=value ..." >&2; exit 1; }
+      local class="$XWIKI_OBJECT_CLASS" number="" have_number=false pairs=()
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --class)  class="$2";  shift 2 ;;
+          --number) number="$2"; have_number=true; shift 2 ;;
+          -*) echo "xw obj set: unknown flag $1" >&2; exit 1 ;;
+          *)  pairs+=("$1"); shift ;;
+        esac
+      done
+      [[ -z "$class" ]] && { echo "xw obj set: set --class or XWIKI_OBJECT_CLASS (e.g. MySpace.Code.MyClass)" >&2; exit 1; }
+      (( ${#pairs[@]} )) || { echo "xw obj set: need at least one key=value" >&2; exit 1; }
+      if ! _page_exists "$ref"; then
+        echo "xw obj set: page $ref does not exist; create it first with 'xw put'" >&2; exit 1
+      fi
+      # Build property#<key>=<encoded value> body from key=value args.
+      local body="" p key val
+      for p in "${pairs[@]}"; do
+        key="${p%%=*}"; val="${p#*=}"
+        body+="&property%23$(_urlencode "$key")=$(_urlencode "$val")"
+      done
+      body="${body#&}"
+      local base; base="$(_ref_to_url "$ref")"
+      local classurl; classurl="$(_urlencode "$class")"
+      # Update if --number given or an object of this class already exists; else create.
+      if ! $have_number; then
+        number=$(_rest "$base/objects" \
+          | jq -r --arg c "$class" 'first(.objectSummaries[] | select(.className==$c) | .number) // empty')
+        [[ -n "$number" ]] && have_number=true
+      fi
+      if $have_number; then
+        _restwrite PUT "$base/objects/$classurl/$number" \
+          application/x-www-form-urlencoded "$body" >/dev/null
+      else
+        number=0
+        _restwrite POST "$base/objects" \
+          application/x-www-form-urlencoded "className=$classurl&$body" >/dev/null
+      fi
+      _cache_evict "$ref"
+      echo "set: $ref $class[$number]" >&2
+      ;;
+    *)
+      echo "xw obj: {set|ls|get} <ref> ..." >&2; exit 1
+      ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -332,6 +499,8 @@ case "$cmd" in
   search)  cmd_search  "$@" ;;
   find)    cmd_find    "$@" ;;
   grep)    cmd_grep    "$@" ;;
+  put)     cmd_put     "$@" ;;
+  obj)     cmd_obj     "$@" ;;
   cache)   cmd_cache   "$@" ;;
   man)     cmd_man     "$@" ;;
   ""|help|--help|-h)
@@ -351,6 +520,15 @@ Search:
   search <terms> [--space S] [--author A] [--since N] [--sort S] [--limit N]
   find [-name glob] [-space S] [-author A] [-since N] [-n N]
   grep [-l] <pattern> [--space S] [--field F]
+
+Write:  (mutates the wiki)
+  put <ref> [--title T] [--syntax S] (--content C | --file F | -)
+                                 create/update a page (idempotent PUT)
+  obj ls <ref>                   list XObjects attached to a page
+  obj get <ref> [--class C] [--number N]
+                                 print an object's properties (key=value)
+  obj set <ref> [--class C] [--number N] key=value ...
+                                 create/update an AWM/XObject record (page must exist)
 
 Cache:
   cache add <ref>                fetch and cache a page

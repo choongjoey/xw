@@ -1,8 +1,9 @@
 # xw — Claude Code Skill
 
-`xw` is a shell CLI for reading and searching an XWiki instance. Use it whenever
-a task requires navigating wiki content, looking up knowledge articles, or
-searching for pages by title, content, or metadata.
+`xw` is a shell CLI for reading, searching, and creating/updating an XWiki
+instance. Use it whenever a task requires navigating wiki content, looking up
+knowledge articles, searching for pages by title, content, or metadata, or
+creating/updating pages and AppWithinMinutes (AWM) records.
 
 ## Setup (required before any command)
 
@@ -20,14 +21,20 @@ export XWIKI_OBJECT_CLASS=MySpace.Code.MyClass  # only needed for grep --field
 ## Decision tree — pick the right command
 
 ```
-Do you know the exact page reference?
-  yes → xw cat / head / tail / range / outline
-  no  →
-    Searching by title only (fast)?        → xw find -name "*glob*"
-    Searching by content / relevance?      → xw search "terms"
-    Filtering by space / author / date?    → xw find / xw search with flags
-    Matching a specific XObject property?  → xw grep --field <prop>
-    Browsing what spaces exist?            → xw ls [space]
+Reading, or writing?
+  reading →
+    Do you know the exact page reference?
+      yes → xw cat / head / tail / range / outline
+      no  →
+        Searching by title only (fast)?        → xw find -name "*glob*"
+        Searching by content / relevance?      → xw search "terms"
+        Filtering by space / author / date?    → xw find / xw search with flags
+        Matching a specific XObject property?  → xw grep --field <prop>
+        Browsing what spaces exist?            → xw ls [space]
+  writing →
+    Create or update a page's content?       → xw put <ref> ...
+    Set an AWM / XObject field on a page?    → xw obj set <ref> ...  (page must exist)
+    Inspect objects on a page?               → xw obj ls / obj get
 ```
 
 ---
@@ -117,6 +124,53 @@ match structured metadata (tags, descriptions, custom fields) rather than page b
 
 ---
 
+## Writing
+
+> These commands mutate the live wiki. Confirm the target ref/space first.
+
+### `xw put` — create or update a page
+
+Idempotent: creates the page if it doesn't exist, overwrites it if it does.
+Content comes from `--content`, `--file`, or stdin. Syntax defaults to
+`xwiki/2.1`. The cached copy is evicted on success.
+
+```bash
+xw put Sandbox.XwTest --title "xw test" --content "= Hello =
+
+body line"
+xw put Sandbox.XwTest --file page.xwiki
+some-generator | xw put Sandbox.XwTest -
+```
+
+### `xw obj set` — create or update an AWM / XObject record
+
+An AWM record is an XObject of an app's data class attached to a page. Set
+fields as `key=value` args. Class comes from `--class` or `$XWIKI_OBJECT_CLASS`.
+Without `--number`, `xw` updates the first existing object of that class (or
+creates number 0); pass `--number` to target a specific one.
+
+```bash
+xw obj set Sandbox.XwTest --class MyApp.Code.MyAppClass name="Widget" status=Open
+xw obj set Sandbox.XwTest --class MyApp.Code.MyAppClass status=Closed   # same object
+```
+
+**Rule: the page must already exist before `obj set`.** If it doesn't, `xw`
+errors and tells you to run `xw put` first. So the create-a-record flow is:
+
+```bash
+xw put Sandbox.XwTest --content "record page"          # 1. ensure the page
+xw obj set Sandbox.XwTest --class MyApp.Code.MyAppClass name="Widget"  # 2. set fields
+```
+
+### `xw obj ls` / `xw obj get` — inspect objects
+
+```bash
+xw obj ls Sandbox.XwTest                                # <className>[<number>]
+xw obj get Sandbox.XwTest --class MyApp.Code.MyAppClass  # key=value per property
+```
+
+---
+
 ## Cache
 
 Pre-fetch pages you will read more than once in a session. The cache persists
@@ -170,6 +224,9 @@ xw man query_documents
 | `grep --field` | REST (Solr) |
 | `cat`, `head`, `tail`, `range`, `outline`, `wc -l` | MCP `get_document` |
 | `search`, `find` (with filters), `grep` (no field) | MCP `query_documents` |
+| `put` | REST `PUT /pages/<Page>` (JSON) |
+| `obj ls`, `obj get` | REST `GET .../objects[/<class>/<n>]` |
+| `obj set` | REST `POST .../objects` or `PUT .../objects/<class>/<n>` (form) |
 | `man` | MCP `man` |
 
 ---

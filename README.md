@@ -1,9 +1,22 @@
 # xw — XWiki Shell Helper
 
 `xw` is a Unix-style CLI wrapper around XWiki's MCP and REST APIs.
-It lets you navigate, read, and search wiki content from the terminal or from
-an AI agent's tool calls, and maintains a local page cache to eliminate
-repeated API hits.
+It lets you navigate, read, search, and create/update wiki content from the
+terminal or from an AI agent's tool calls, and maintains a local page cache to
+eliminate repeated API hits.
+
+## Use with Claude Code (skill)
+
+`SKILLS.md` is the agent-facing skill guide for `xw` — point Claude Code (or any
+agent) at it so the model knows which command to reach for. To make `xw`
+available to an agent:
+
+1. Put the `xw` script on your `PATH` (e.g. `ln -s "$PWD/xw" ~/bin/xw`).
+2. Export the `XWIKI_*` env vars (see [Auth](#auth)) in the agent's environment.
+3. Tell the agent to read `SKILLS.md` and to **prefer `xw` over ad-hoc `curl`**
+   for any XWiki task — reading, searching, and now writing.
+
+`CLAUDE.md` in the repo root holds guidance for agents editing `xw` itself.
 
 ## Prerequisites
 
@@ -181,6 +194,55 @@ grep -n "keyword" "$(xw cache path "MySpace.LongDocument.WebHome")"
 
 ---
 
+## Write / Edit
+
+> ⚠️ These commands **mutate the live wiki.** `put` is idempotent (a PUT that
+> creates the page if absent, overwrites it if present). `obj set` requires the
+> page to already exist. Confirm the target ref/space before running.
+
+### `xw put <ref> [--title T] [--syntax S] (--content C | --file F | -)`
+Create or update a page. Content comes from `--content`, a `--file`, or stdin
+(pass `-` or just pipe). Syntax defaults to `xwiki/2.1`; `--title` is optional.
+The page's cache entry is evicted on success so the next read is fresh.
+
+```bash
+xw put Sandbox.XwTest --title "xw test" --content "= Hello =
+
+first line"
+xw put Sandbox.XwTest --file page.xwiki
+cat page.xwiki | xw put Sandbox.XwTest -
+```
+
+### `xw obj set <ref> [--class C] [--number N] key=value ...`
+Create or update an AppWithinMinutes (AWM) record — an XObject of an app's data
+class attached to a page. Class defaults to `$XWIKI_OBJECT_CLASS`. Without
+`--number`, `xw` updates the first existing object of that class or creates a new
+one (number 0); pass `--number` to target a specific object.
+
+```bash
+xw obj set Sandbox.XwTest --class MyApp.Code.MyAppClass name="Widget" status=Open
+xw obj set Sandbox.XwTest --class MyApp.Code.MyAppClass status=Closed   # updates same object
+```
+
+The page must exist first — otherwise `xw` errors and points you to `xw put`.
+
+### `xw obj ls <ref>`
+List the XObjects attached to a page as `<className>[<number>]`.
+
+```bash
+xw obj ls Sandbox.XwTest
+```
+
+### `xw obj get <ref> [--class C] [--number N]`
+Print an object's properties as `key=value` lines. Class defaults to
+`$XWIKI_OBJECT_CLASS`, number to 0.
+
+```bash
+xw obj get Sandbox.XwTest --class MyApp.Code.MyAppClass
+```
+
+---
+
 ## Misc
 
 ### `xw man [tool]`
@@ -202,6 +264,9 @@ xw man query_documents
 | `grep --field` | REST `/query?type=solr` |
 | `cat`, `head`, `tail`, `range`, `outline`, `wc -l` | MCP `get_document` |
 | `search`, `find` (with filters), `grep` (no field) | MCP `query_documents` |
+| `put` | REST `PUT /pages/<Page>` (JSON page) |
+| `obj ls`, `obj get` | REST `GET .../objects[/<class>/<n>]` |
+| `obj set` | REST `POST .../objects` or `PUT .../objects/<class>/<n>` (form) |
 | `man` | MCP `man` |
 
 ---
