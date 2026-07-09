@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# xw — XWiki shell helper
+# Auth: XWIKI_USER+XWIKI_PASS or XWIKI_TOKEN (Base64)
+# Config: XWIKI_HOST, XWIKI_WIKI, XWIKI_OBJECT_CLASS, XW_CACHE_DIR
+set -u
+
+: "${XWIKI_HOST:?set XWIKI_HOST (e.g. wiki.example.com)}"
+XWIKI_WIKI="${XWIKI_WIKI:-xwiki}"
+XWIKI_OBJECT_CLASS="${XWIKI_OBJECT_CLASS:-}"
+XW_CACHE_DIR="${XW_CACHE_DIR:-$HOME/.cache/xw/$XWIKI_HOST/$XWIKI_WIKI}"
+
+MCP_URL="https://$XWIKI_HOST/rest/wikis/$XWIKI_WIKI/aiLLM/mcp"
+REST_BASE="https://$XWIKI_HOST/rest/wikis/$XWIKI_WIKI"
+
+_AUTH=()
+if [[ -n "${XWIKI_TOKEN:-}" ]]; then
+  _AUTH=(-H "Authorization: Basic $XWIKI_TOKEN")
+elif [[ -n "${XWIKI_USER:-}" && -n "${XWIKI_PASS:-}" ]]; then
+  _AUTH=(-u "$XWIKI_USER:$XWIKI_PASS")
+else
+  echo "xw: set XWIKI_USER+XWIKI_PASS or XWIKI_TOKEN" >&2; exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+_urlencode() {
+  python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[-1]))" -- "$1"
+}
+
+# Space.Sub.Page  →  /spaces/Space/spaces/Sub/pages/Page
+_ref_to_url() {
+  local IFS='.'
+  read -ra _p <<< "$1"
+  local n=${#_p[@]} url="" i
+  for ((i=0; i<n-1; i++)); do url+="/spaces/$(_urlencode "${_p[$i]}")"; done
+  url+="/pages/$(_urlencode "${_p[$((n-1))]}")"
+  echo "$url"
+}
+
+# Percent-encode ref as a filename (no safe chars)
+_cache_path() {
+  local enc
+  enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[-1],safe=''))" -- "$1")
+  echo "$XW_CACHE_DIR/${enc}.txt"
+}
+
+_cache_hit() { [[ -s "$(_cache_path "$1")" ]]; }
+
+# Lines after the first blank line in an MCP cached response
+# (skips: Reference / Title / Syntax / Size header block)
+_cache_body() { awk 'p; /^[[:space:]]*$/{p=1}' "$1"; }
+
+_mcp() {
+  curl -s "${_AUTH[@]}" -X POST "$MCP_URL" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -d "$1" | jq -r '.result.content[0].text'
+}
+
+_rest()  { curl -s "${_AUTH[@]}" "$REST_BASE$1" -H "Accept: application/json"; }
+
+# _restq PATH [--data-urlencode KEY=VAL ...]
+_restq() { local p="$1"; shift; curl -s "${_AUTH[@]}" -G "$REST_BASE$p" "$@" -H "Accept: application/json"; }
+
+# Parse "Size: N lines · ..." → N
+_size_lines() { awk '/^Size:/{print $2; exit}'; }
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_ls() {
+  local space="${1:-}"
+  if [[ -z "$space" ]]; then
+    _rest "/spaces" | jq -r \
+      '.spaces[] | select(.id | split(":")[1] | contains(".") | not) | .name'
+  else
+    local wiki="$XWIKI_WIKI"
+    _rest "/spaces" | jq -r --arg w "$wiki" --arg s "$space" \
+      '.spaces[] | select(.id | test("^"+$w+":"+$s+"\\.[^.]+$")) | .name'
+  fi
+}
+
+cmd_cat() {
+  local ref="$1"
+  if _cache_hit "$ref"; then cat "$(_cache_path "$ref")"; return; fi
+  _mcp "$(jq -nc --arg r "$ref" \
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_document","arguments":{"reference":$r}}}')"
+}
+
+cmd_head() {
+  local n=20
+  [[ "${1:-}" == "-n" ]] && { n="$2"; shift 2; }
+  local ref="$1"
+  if _cache_hit "$ref"; then _cache_body "$(_cache_path "$ref")" | head -n "$n"; return; fi
+  _mcp "$(jq -nc --arg r "$ref" --argjson n "$n" \
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_document","arguments":{"reference":$r,"offset":1,"limit":$n}}}')"
+}
+
+cmd_tail() {
+  local n=20
+  [[ "${1:-}" == "-n" ]] && { n="$2"; shift 2; }
+  local ref="$1"
+  if _cache_hit "$ref"; then _cache_body "$(_cache_path "$ref")" | tail -n "$n"; return; fi
+  # Step 1: outline to get line count
+  local outline
+  outline=$(_mcp "$(jq -nc --arg r "$ref" \
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_document","arguments":{"reference":$r,"outline":true}}}')")
+  local total
+  total=$(echo "$outline" | _size_lines)
+  if [[ -z "$total" ]]; then echo "xw tail: could not determine line count" >&2; exit 1; fi
+  local offset=$(( total - n + 1 ))
+  (( offset < 1 )) && offset=1
+  # Step 2: read the tail range
+  _mcp "$(jq -nc --arg r "$ref" --argjson o "$offset" --argjson l "$n" \
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_document","arguments":{"reference":$r,"offset":$o,"limit":$l}}}')"
+}
+
+cmd_range() {
+  local ref="$1" start="$2" end="$3"
+  local limit=$(( end - start + 1 ))
+  if _cache_hit "$ref"; then
+    # content lines carry embedded line numbers: "     N  text" — filter by N
+    _cache_body "$(_cache_path "$ref")" | \
+      awk -v s="$start" -v e="$end" \
+        'match($0,/^ *([0-9]+)  /,a){n=int(a[1]); if(n>=s && n<=e) print}'
+    return
+  fi
+  _mcp "$(jq -nc --arg r "$ref" --argjson o "$start" --argjson l "$limit" \
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_document","arguments":{"reference":$r,"offset":$o,"limit":$l}}}')"
+}
+
+cmd_outline() {
+  local ref="$1"
+  if _cache_hit "$ref"; then
+    local path; path=$(_cache_path "$ref")
+    grep 'Size:' "$path" || true
+    # Extract heading lines from cached numbered content
+    _cache_body "$path" | \
+      awk 'match($0,/^ *([0-9]+)  (#+|=+)/,a){print a[1]": "substr($0,RSTART+RLENGTH)}'
+    return
+  fi
+  _mcp "$(jq -nc --arg r "$ref" \
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_document","arguments":{"reference":$r,"outline":true}}}')"
+}
+
+cmd_wc() {
+  local flag=""
+  [[ "${1:-}" == "-l" ]] && { flag="-l"; shift; }
+  local target="$1"
+  if [[ "$flag" == "-l" ]]; then
+    if _cache_hit "$target"; then
+      _size_lines < "$(_cache_path "$target")" || \
+        _cache_body "$(_cache_path "$target")" | wc -l | tr -d ' '
+      return
+    fi
+    local outline
+    outline=$(_mcp "$(jq -nc --arg r "$target" \
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_document","arguments":{"reference":$r,"outline":true}}}')")
+    echo "$outline" | _size_lines || echo "$outline"
+  else
+    local wiki="$XWIKI_WIKI"
+    _rest "/spaces" | jq --arg w "$wiki" --arg s "$target" \
+      '[.spaces[] | select(.id | test("^"+$w+":"+$s+"\\.[^.]+$"))] | length'
+  fi
+}
+
+cmd_search() {
+  local query="${1:-}"; shift || true
+  local space="" author="" since="" sort="relevance" limit=10
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --space)  space="$2";  shift 2 ;;
+      --author) author="$2"; shift 2 ;;
+      --since)  since="$2";  shift 2 ;;
+      --sort)   sort="$2";   shift 2 ;;
+      --limit)  limit="$2";  shift 2 ;;
+      *) echo "xw search: unknown flag $1" >&2; exit 1 ;;
+    esac
+  done
+  local args
+  args=$(jq -nc \
+    --arg q "$query" --arg sp "$space" --arg au "$author" \
+    --arg si "$since" --arg so "$sort" --argjson lim "$limit" \
+    '{query:$q,sort:$so,limit:$lim}
+     | if $sp!="" then .+{space:$sp}         else . end
+     | if $au!="" then .+{author:$au}        else . end
+     | if $si!="" then .+{modifiedWithin:$si} else . end')
+  _mcp "$(jq -nc --argjson a "$args" \
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_documents","arguments":$a}}')"
+}
+
+cmd_find() {
+  local name="" space="" author="" since="" n=20
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -name)   name="$2";   shift 2 ;;
+      -space)  space="$2";  shift 2 ;;
+      -author) author="$2"; shift 2 ;;
+      -since)  since="$2";  shift 2 ;;
+      -n)      n="$2";      shift 2 ;;
+      *) echo "xw find: unknown flag $1" >&2; exit 1 ;;
+    esac
+  done
+  if [[ -n "$name" && -z "$space" && -z "$author" && -z "$since" ]]; then
+    # REST title-only search
+    _restq "/search" \
+      --data-urlencode "q=$name" \
+      --data-urlencode "scope=name" \
+      --data-urlencode "number=$n" \
+      | jq -r '.searchResults[].pageFullName'
+  else
+    local args
+    args=$(jq -nc \
+      --arg q "${name:-}" --arg sp "$space" --arg au "$author" \
+      --arg si "$since" --argjson lim "$n" \
+      '{query:$q,limit:$lim}
+       | if $sp!="" then .+{space:$sp}         else . end
+       | if $au!="" then .+{author:$au}        else . end
+       | if $si!="" then .+{modifiedWithin:$si} else . end')
+    _mcp "$(jq -nc --argjson a "$args" \
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_documents","arguments":$a}}')"
+  fi
+}
+
+cmd_grep() {
+  local suppress=false
+  [[ "${1:-}" == "-l" ]] && { suppress=true; shift; }
+  local pattern="${1:-}"; shift || true
+  local space="" field=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -l)      suppress=true; shift ;;
+      --space) space="$2"; shift 2 ;;
+      --field) field="$2"; shift 2 ;;
+      *) echo "xw grep: unknown flag $1" >&2; exit 1 ;;
+    esac
+  done
+
+  if [[ -n "$field" ]]; then
+    if [[ -z "$XWIKI_OBJECT_CLASS" ]]; then
+      echo "xw grep --field: set XWIKI_OBJECT_CLASS (e.g. MySpace.Code.MyClass)" >&2; exit 1
+    fi
+    # REST Solr field query on a specific XObject property
+    local q="property.${XWIKI_OBJECT_CLASS}.${field}:${pattern}"
+    if $suppress; then
+      _restq "/query" \
+        --data-urlencode "q=$q" \
+        --data-urlencode "type=solr" \
+        --data-urlencode "number=20" \
+        | jq -r '.searchResults[].pageFullName'
+    else
+      _restq "/query" \
+        --data-urlencode "q=$q" \
+        --data-urlencode "type=solr" \
+        --data-urlencode "number=20" \
+        | jq -r '.searchResults[] | "\(.score)\t\(.pageFullName)\t\(.title)"'
+    fi
+  else
+    # MCP query_documents (space filter supported; -l not parsed from MCP text)
+    local args
+    args=$(jq -nc --arg q "$pattern" --arg sp "$space" \
+      '{query:$q,limit:20} | if $sp!="" then .+{space:$sp} else . end')
+    _mcp "$(jq -nc --argjson a "$args" \
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_documents","arguments":$a}}')"
+  fi
+}
+
+cmd_cache() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    add)
+      local ref="$1"
+      local path; path=$(_cache_path "$ref")
+      mkdir -p "$(dirname "$path")"
+      _mcp "$(jq -nc --arg r "$ref" \
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_document","arguments":{"reference":$r}}}')" \
+        > "$path"
+      echo "cached: $path" >&2
+      ;;
+    ls)
+      if [[ ! -d "$XW_CACHE_DIR" ]]; then echo "(cache empty)"; return; fi
+      local found=0
+      while IFS= read -r -d '' f; do
+        found=1
+        local enc; enc=$(basename "$f" .txt)
+        python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[-1]))" -- "$enc"
+      done < <(find "$XW_CACHE_DIR" -maxdepth 1 -name '*.txt' -print0 2>/dev/null)
+      (( found )) || echo "(cache empty)"
+      ;;
+    rm)
+      local path; path=$(_cache_path "$1")
+      rm -f "$path" && echo "removed: $path"
+      ;;
+    clear)
+      find "$XW_CACHE_DIR" -maxdepth 1 -name '*.txt' -delete 2>/dev/null
+      echo "cache cleared: $XW_CACHE_DIR"
+      ;;
+    path)
+      _cache_path "$1"
+      ;;
+    *)
+      echo "xw cache: {add|ls|rm|clear|path} <ref>" >&2; exit 1
+      ;;
+  esac
+}
+
+cmd_man() {
+  if [[ $# -eq 0 ]]; then
+    _mcp '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"man","arguments":{}}}'
+  else
+    _mcp "$(jq -nc --arg t "$1" \
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"man","arguments":{"tool":$t}}}')"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  ls)      cmd_ls      "$@" ;;
+  cat)     cmd_cat     "$@" ;;
+  head)    cmd_head    "$@" ;;
+  tail)    cmd_tail    "$@" ;;
+  range)   cmd_range   "$@" ;;
+  outline) cmd_outline "$@" ;;
+  wc)      cmd_wc      "$@" ;;
+  search)  cmd_search  "$@" ;;
+  find)    cmd_find    "$@" ;;
+  grep)    cmd_grep    "$@" ;;
+  cache)   cmd_cache   "$@" ;;
+  man)     cmd_man     "$@" ;;
+  ""|help|--help|-h)
+    cat >&2 <<'HELP'
+xw — XWiki shell helper
+
+Read:
+  ls [space]                     list spaces / sub-spaces
+  cat <ref>                      full page (metadata header + numbered content)
+  head [-n N] <ref>              first N lines (default 20)
+  tail [-n N] <ref>              last N lines  (default 20)
+  range <ref> <start> <end>      line range (1-based)
+  outline <ref>                  heading map with line numbers
+  wc [-l] <space|ref>            -l: line count of page; else: sub-space count
+
+Search:
+  search <terms> [--space S] [--author A] [--since N] [--sort S] [--limit N]
+  find [-name glob] [-space S] [-author A] [-since N] [-n N]
+  grep [-l] <pattern> [--space S] [--field F]
+
+Cache:
+  cache add <ref>                fetch and cache a page
+  cache ls                       list cached refs
+  cache rm <ref>                 remove a cached entry
+  cache clear                    remove all cached entries
+  cache path <ref>               print cache file path
+
+Misc:
+  man [tool]                     MCP tool catalog or docs for a tool
+
+Auth env vars:
+  XWIKI_USER + XWIKI_PASS        basic auth credentials
+  XWIKI_TOKEN                    pre-encoded Base64 (overrides user/pass)
+  XWIKI_HOST                     wiki hostname (required, no default)
+  XWIKI_WIKI                     wiki name (default: xwiki)
+  XWIKI_OBJECT_CLASS             XObject class for --field queries (e.g. MySpace.Code.MyClass)
+  XW_CACHE_DIR                   default: ~/.cache/xw/<host>/<wiki>/
+HELP
+    ;;
+  *)
+    echo "xw: unknown command '$cmd'. Run 'xw help' for usage." >&2; exit 1 ;;
+esac
