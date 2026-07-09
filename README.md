@@ -34,7 +34,7 @@ export XWIKI_TOKEN=<Base64(user:pass)>  # overrides user/pass
 
 # Optional
 export XWIKI_WIKI=xwiki                 # default: xwiki
-export XWIKI_OBJECT_CLASS=MySpace.Code.MyClass   # needed for grep --field
+export XWIKI_OBJECT_CLASS=MySpace.Code.MyClass   # default class for grep --field and obj (override with --class)
 export XW_CACHE_DIR=~/.cache/xw/$XWIKI_HOST/$XWIKI_WIKI
 ```
 
@@ -245,16 +245,18 @@ Docs.Install.Windows.WebHome
 
 ---
 
-### `xw grep [-l] <pattern> [--space S] [--field F]`
+### `xw grep [-l] <pattern> [--space S] [--field F] [--class C]`
 Content and property search.
 
 - No `--field`: MCP `query_documents` full-text search (same block format as `search`).
-- `--field F`: REST Solr query on a specific XObject property field
-  (requires `XWIKI_OBJECT_CLASS`). Output: `score\tref\ttitle`. With `-l`: refs only.
+- `--field F`: REST Solr query on a specific XObject property field. The class
+  defaults to `$XWIKI_OBJECT_CLASS`; `--class C` overrides it for that one call
+  (one of the two must be set). Output: `score\tref\ttitle`. With `-l`: refs only.
 
 ```bash
 xw grep "install" --space Docs
-xw grep "onboarding" --field keywords
+xw grep "onboarding" --field keywords                             # env default class
+xw grep "onboarding" --field keywords --class Other.Code.OtherClass  # override
 xw grep "onboarding" --field keywords -l
 ```
 

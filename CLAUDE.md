@@ -13,7 +13,7 @@ records (XObjects of an app's data class attached to a page).
 | `XWIKI_USER` + `XWIKI_PASS` | one of these | basic auth |
 | `XWIKI_TOKEN` | or this | pre-encoded `Base64(user:pass)`, overrides user/pass |
 | `XWIKI_WIKI` | no | wiki name (default `xwiki`) |
-| `XWIKI_OBJECT_CLASS` | no | default XObject class for `grep --field` and `obj` |
+| `XWIKI_OBJECT_CLASS` | no | default XObject class for `grep --field` and `obj` (override per-call with `--class`) |
 | `XW_CACHE_DIR` | no | default `~/.cache/xw/<host>/<wiki>/` |
 
 ## Command map

@@ -444,22 +444,23 @@ cmd_grep() {
   local suppress=false
   [[ "${1:-}" == "-l" ]] && { suppress=true; shift; }
   local pattern="${1:-}"; shift || true
-  local space="" field=""
+  local space="" field="" class="$XWIKI_OBJECT_CLASS"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -l)      suppress=true; shift ;;
       --space) space="$2"; shift 2 ;;
       --field) field="$2"; shift 2 ;;
+      --class) class="$2"; shift 2 ;;
       *) echo "xw grep: unknown flag $1" >&2; exit 1 ;;
     esac
   done
 
   if [[ -n "$field" ]]; then
-    if [[ -z "$XWIKI_OBJECT_CLASS" ]]; then
-      echo "xw grep --field: set XWIKI_OBJECT_CLASS (e.g. MySpace.Code.MyClass)" >&2; exit 1
+    if [[ -z "$class" ]]; then
+      echo "xw grep --field: set --class or XWIKI_OBJECT_CLASS (e.g. MySpace.Code.MyClass)" >&2; exit 1
     fi
     # REST Solr field query on a specific XObject property
-    local q="property.${XWIKI_OBJECT_CLASS}.${field}:${pattern}"
+    local q="property.${class}.${field}:${pattern}"
     if $suppress; then
       _restq "/query" \
         --data-urlencode "q=$q" \
@@ -1063,7 +1064,7 @@ Read:
 Search:
   search <terms> [--space S] [--author A] [--since N] [--sort S] [--limit N]
   find [-name glob] [-space S] [-author A] [-since N] [-n N]
-  grep [-l] <pattern> [--space S] [--field F]
+  grep [-l] <pattern> [--space S] [--field F] [--class C]
 
 Write:  (mutates the wiki)
   put <ref> [--title T] [--syntax S] [--parent P] (--content C | --file F | -)
@@ -1122,7 +1123,7 @@ Auth env vars:
   XWIKI_TOKEN                    pre-encoded Base64 (overrides user/pass)
   XWIKI_HOST                     wiki hostname (required, no default)
   XWIKI_WIKI                     wiki name (default: xwiki)
-  XWIKI_OBJECT_CLASS             XObject class for --field queries (e.g. MySpace.Code.MyClass)
+  XWIKI_OBJECT_CLASS             default XObject class for grep --field and obj (override per-call with --class)
   XW_CACHE_DIR                   default: ~/.cache/xw/<host>/<wiki>/
 HELP
     ;;

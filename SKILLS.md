@@ -13,7 +13,22 @@ export XWIKI_USER=yourname
 export XWIKI_PASS=yourpassword
 # optional
 export XWIKI_WIKI=xwiki              # default: xwiki
-export XWIKI_OBJECT_CLASS=MySpace.Code.MyClass  # only needed for grep --field
+export XWIKI_OBJECT_CLASS=MySpace.Code.MyClass  # default class for grep --field and obj
+```
+
+### Config resolution — env default, flag override
+
+The XObject class follows one rule everywhere it's used (`grep --field`, `obj
+get/set/rm`): **`$XWIKI_OBJECT_CLASS` is the default; a `--class` flag overrides
+it for that one call.** Set the env var for the app you work in most, and reach
+for `--class` only when you cross into another AWM app. Either must be present —
+if neither is set, the command errors. (Auth resolves the same way: `XWIKI_TOKEN`
+overrides `XWIKI_USER`/`XWIKI_PASS`.)
+
+```bash
+export XWIKI_OBJECT_CLASS=ServiceDesk.Code.ServiceDeskClass  # the everyday default
+xw grep lolita --field keywords                              # uses the env default
+xw grep lolita --field keywords --class Other.Code.OtherClass  # override, this call only
 ```
 
 ---
@@ -128,11 +143,13 @@ switches to MCP `query_documents`.
 xw grep "GDPR" --space Legal           # full-text via MCP
 xw grep "onboarding" --field keywords  # specific XObject property via Solr
 xw grep "onboarding" --field keywords -l  # refs only (no titles/scores)
+xw grep "onboarding" --field keywords --class Other.Code.OtherClass  # override class
 ```
 
-`--field` requires `XWIKI_OBJECT_CLASS` to be set. Use it when you need to
-match structured metadata (tags, descriptions, custom fields) rather than page body.
-`-l` works anywhere in the flag list.
+`--field` needs an XObject class: it uses `$XWIKI_OBJECT_CLASS` by default, or
+`--class C` to override per call (see *Config resolution* above). Use it when you
+need to match structured metadata (tags, descriptions, custom fields) rather than
+page body. `-l` works anywhere in the flag list.
 
 ---
 
