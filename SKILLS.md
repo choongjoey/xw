@@ -32,9 +32,21 @@ Reading, or writing?
         Matching a specific XObject property?  → xw grep --field <prop>
         Browsing what spaces exist?            → xw ls [space]
   writing →
-    Create or update a page's content?       → xw put <ref> ...
-    Set an AWM / XObject field on a page?    → xw obj set <ref> ...  (page must exist)
-    Inspect objects on a page?               → xw obj ls / obj get
+    Overwrite a whole page?                  → xw put <ref> ...
+    Add to the end of a page?                → xw append <ref> ...
+    Replace one section (under a heading)?   → xw section set <ref> <heading> ...
+    Find-and-replace a literal string?       → xw edit <ref> --replace OLD --with NEW
+    Change parent/title, keep content?       → xw meta set <ref> [--parent P] [--title T]
+    Delete a page?                           → xw rm <ref> [--purge]
+    Rename or move a page?                   → xw mv <src> <dst>
+    Manage a page's tags?                    → xw tag {ls|add|rm|set} <ref> ...
+    Attach / fetch a file?                   → xw attach {ls|put|get|rm} <ref> ...
+    Set/inspect an AWM / XObject field?      → xw obj {set|ls|get|rm} <ref> ...  (page must exist)
+    Guard against a concurrent edit?         → add --if-version N or --create-only
+  history / links →
+    Revision history of a page?              → xw log <ref>
+    Read / diff an old revision?             → xw cat <ref> --version V ; xw diff <ref> v1 v2
+    What links to / from a page?             → xw backlinks <ref> / xw links <ref>
 ```
 
 ---
@@ -162,12 +174,105 @@ xw put Sandbox.XwTest --content "record page"          # 1. ensure the page
 xw obj set Sandbox.XwTest --class MyApp.Code.MyAppClass name="Widget"  # 2. set fields
 ```
 
-### `xw obj ls` / `xw obj get` — inspect objects
+### `xw obj ls` / `xw obj get` / `xw obj rm` — inspect / delete objects
 
 ```bash
-xw obj ls Sandbox.XwTest                                # <className>[<number>]
-xw obj get Sandbox.XwTest --class MyApp.Code.MyAppClass  # key=value per property
+xw obj ls Sandbox.XwTest                                 # <className>[<number>]
+xw obj get Sandbox.XwTest --class MyApp.Code.MyAppClass   # key=value per property
+xw obj rm  Sandbox.XwTest --class MyApp.Code.MyAppClass    # delete (first of class, or --number N)
 ```
+
+### In-place editing — the everyday "edit a file" operations
+
+`put` overwrites the whole page. These three edit **in place** — they fetch the
+current content, mutate it, and re-PUT preserving title/syntax (cache evicted).
+All require the page to exist.
+
+```bash
+xw append Sandbox.XwTest --content "a new trailing line"   # or --file F / stdin
+xw section set Sandbox.XwTest "Overview" --content "..."     # replace body under the = Overview = heading
+xw edit Sandbox.XwTest --replace "TODO" --with "DONE"        # literal replace-all (--first for one); errors if no match
+```
+
+`section set` matches an xwiki/2.1 heading (`= H =` … `====== H ======`) and
+replaces everything under it up to the next heading of the same or higher level.
+`edit` is a literal (non-regex) substitution and reports the match count.
+
+### `xw meta set` — change parent/title without touching content
+
+```bash
+xw meta set Sandbox.XwTest --parent Sandbox.WebHome --title "New Title"
+```
+
+The frontmatter-parity path: resends the current content unchanged and only
+moves `parent`/`title`.
+
+### `xw rm` / `xw mv` — delete, rename, move
+
+```bash
+xw rm Sandbox.XwTest              # → recycle bin
+xw rm Sandbox.XwTest --purge      # skip recycle bin (permanent)
+xw mv Sandbox.Old Sandbox.New     # rename in place
+xw mv Sandbox.Old Other.Space.New # move across spaces (async refactoring job)
+```
+
+`rm` deletes a **single** document (its own objects + attachments go with it; it
+does **not** recurse into child pages). `mv` submits an async job, polls to
+completion, and removes the source (no redirect placeholder left behind).
+
+### `xw tag` — manage page tags
+
+```bash
+xw tag ls  Sandbox.XwTest
+xw tag add Sandbox.XwTest api draft
+xw tag rm  Sandbox.XwTest draft
+xw tag set Sandbox.XwTest api stable   # replace the whole set
+```
+
+### `xw attach` — attachments
+
+```bash
+xw attach ls  Sandbox.XwTest
+xw attach put Sandbox.XwTest ./diagram.png [--name diagram.png]
+xw attach get Sandbox.XwTest diagram.png -o ./out.png   # omit -o to stream to stdout
+xw attach rm  Sandbox.XwTest diagram.png
+```
+
+### Concurrency guards (opt-in)
+
+Default writes are last-write-wins. Pass a guard to `put`/`append`/`section
+set`/`edit`/`meta set` to make the write conditional:
+
+```bash
+xw put Sandbox.XwTest --content "..." --create-only          # abort if it already exists
+xw append Sandbox.XwTest --content "..." --if-version 3.1     # abort unless current version is 3.1
+```
+
+Best-effort (GET-then-compare — XWiki has no server-side ETag), so a small
+race window remains. Use `xw log <ref>` to read the current version first.
+
+---
+
+## History & diff
+
+```bash
+xw log Sandbox.XwTest              # version <tab> date <tab> author <tab> comment (newest first)
+xw log Sandbox.XwTest -n 5         # last 5 revisions
+xw cat Sandbox.XwTest --version 2.1   # content of an old revision
+xw diff Sandbox.XwTest 1.1 3.1     # unified diff between two revisions
+```
+
+## Link graph
+
+```bash
+xw backlinks Sandbox.XwTest        # pages that link TO this one (Solr): score <tab> ref <tab> title
+xw backlinks Sandbox.XwTest -l     # refs only
+xw links Sandbox.XwTest            # outbound [[...]] doc links FROM this page (best-effort)
+```
+
+`backlinks` depends on the Solr index (a freshly created link may take a moment
+to appear). `links` parses `[[...]]` targets from the raw content and is
+xwiki-syntax-dependent (external URLs / attachments are skipped).
 
 ---
 
@@ -224,9 +329,17 @@ xw man query_documents
 | `grep --field` | REST (Solr) |
 | `cat`, `head`, `tail`, `range`, `outline`, `wc -l` | MCP `get_document` |
 | `search`, `find` (with filters), `grep` (no field) | MCP `query_documents` |
-| `put` | REST `PUT /pages/<Page>` (JSON) |
+| `put`, `append`, `section set`, `edit`, `meta set` | REST `PUT /pages/<Page>` (JSON) |
+| `rm` | REST `DELETE /pages/<Page>` |
+| `mv` | REST jobs API `PUT /rest/jobs` (XML) + poll `/rest/jobstatus/<id>` |
+| `tag ls/add/rm/set` | REST `GET`/`PUT .../pages/<Page>/tags` |
+| `log`, `cat --version`, `diff` | REST `GET .../history[/<v>]` |
+| `backlinks` | REST `/query?type=solr` (`links:` field) |
+| `links` | REST page GET, `[[...]]` parsed client-side |
+| `attach ls/put/get/rm` | REST `GET/PUT/DELETE .../attachments/<name>` |
 | `obj ls`, `obj get` | REST `GET .../objects[/<class>/<n>]` |
 | `obj set` | REST `POST .../objects` or `PUT .../objects/<class>/<n>` (form) |
+| `obj rm` | REST `DELETE .../objects/<class>/<n>` |
 | `man` | MCP `man` |
 
 ---

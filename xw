@@ -82,27 +82,37 @@ _form_token() {
   printf '%s' "$_FORM_TOKEN"
 }
 
-# _restwrite METHOD PATH CONTENT_TYPE BODY — write transport.
-# Sends BODY to REST_BASE$PATH; splits trailing HTTP status from the response.
-# On non-2xx: prints body + status to stderr and exits 1. On success: echoes body.
-_restwrite() {
-  local method="$1" path="$2" ctype="$3" body="$4"
+# _http METHOD URL CTYPE LABEL [curl-data-args...] — write-transport core.
+# Adds auth + CSRF form token, sends to URL, splits the trailing HTTP status,
+# echoes the body on 2xx, and on non-2xx prints "xw: LABEL -> HTTP …" + body to
+# stderr and exits 1. Empty CTYPE omits Content-Type (e.g. DELETE).
+_http() {
+  local method="$1" url="$2" ctype="$3" label="$4"; shift 4
   local hdr=() token
   token=$(_form_token)
   [[ -n "$token" ]] && hdr=(-H "XWiki-Form-Token: $token")
-  local resp status
-  resp=$(curl -s "${_AUTH[@]}" -X "$method" "$REST_BASE$path" \
-    -H "Content-Type: $ctype" -H "Accept: application/json" \
-    "${hdr[@]+"${hdr[@]}"}" -w $'\n%{http_code}' --data-binary "$body")
-  status="${resp##*$'\n'}"
-  body="${resp%$'\n'*}"
+  [[ -n "$ctype" ]] && hdr+=(-H "Content-Type: $ctype")
+  local resp status body
+  resp=$(curl -s "${_AUTH[@]}" -X "$method" "$url" -H "Accept: application/json" \
+    "${hdr[@]+"${hdr[@]}"}" -w $'\n%{http_code}' "$@")
+  status="${resp##*$'\n'}"; body="${resp%$'\n'*}"
   if [[ "$status" != 2* ]]; then
-    echo "xw: $method $path -> HTTP $status" >&2
+    echo "xw: $label -> HTTP $status" >&2
     [[ -n "$body" ]] && echo "$body" >&2
     exit 1
   fi
   printf '%s' "$body"
 }
+
+# REST write transports (thin wrappers over _http). All echo the response body.
+#   _restwrite     METHOD PATH CTYPE BODY  — JSON/form body under REST_BASE
+#   _restdel       PATH                    — DELETE under REST_BASE (no body)
+#   _restwrite_bin METHOD PATH CTYPE FILE  — stream a file (attachment upload)
+#   _restroot      METHOD PATH CTYPE BODY  — for the jobs API at /rest/… (outside REST_BASE)
+_restwrite()     { _http "$1" "$REST_BASE$2" "$3" "$1 $2" --data-binary "$4"; }
+_restdel()       { _http DELETE "$REST_BASE$1" "" "DELETE $1"; }
+_restwrite_bin() { _http "$1" "$REST_BASE$2" "$3" "$1 $2" --data-binary @"$4"; }
+_restroot()      { _http "$1" "https://$XWIKI_HOST/rest$2" "$3" "$1 /rest$2" --data-binary "$4"; }
 
 # _page_exists REF — true iff GET on the page resource returns 2xx.
 _page_exists() {
@@ -114,6 +124,100 @@ _page_exists() {
 
 # _cache_evict REF — drop any cached copy so a stale read can't survive a write.
 _cache_evict() { rm -f "$(_cache_path "$1")"; }
+
+# _page_json REF — raw page GET JSON (source of .content/.title/.syntax/.version/.parent).
+_page_json() { _rest "$(_ref_to_url "$1")"; }
+
+# _precond REF IF_VERSION CREATE_ONLY — opt-in optimistic-lock / create guard.
+# IF_VERSION: expected current .version ("" to skip). CREATE_ONLY: "true" to require the page NOT exist.
+# Best-effort: GET-then-compare with a small TOCTOU window (XWiki has no server-side ETag).
+_precond() {
+  local ref="$1" if_version="$2" create_only="$3"
+  if [[ "$create_only" == true ]]; then
+    if _page_exists "$ref"; then
+      echo "xw: --create-only: page $ref already exists (aborting)" >&2; exit 1
+    fi
+    return
+  fi
+  if [[ -n "$if_version" ]]; then
+    local cur
+    cur=$(_page_json "$ref" | jq -r '.version // empty')
+    if [[ -z "$cur" ]]; then
+      echo "xw: --if-version $if_version: page $ref not found (no current version)" >&2; exit 1
+    fi
+    if [[ "$cur" != "$if_version" ]]; then
+      echo "xw: --if-version $if_version: page $ref is at version $cur (aborting)" >&2; exit 1
+    fi
+  fi
+}
+
+# _write_page REF TITLE SYNTAX CONTENT PARENT — build JSON page body and PUT.
+# Empty TITLE or PARENT are omitted from the body.
+_write_page() {
+  local ref="$1" title="$2" syntax="$3" content="$4" parent="$5"
+  local body
+  body=$(jq -nc --arg t "$title" --arg s "$syntax" --arg c "$content" --arg p "$parent" \
+    '{syntax:$s,content:$c}
+     | if $t!="" then .+{title:$t} else . end
+     | if $p!="" then .+{parent:$p} else . end')
+  _restwrite PUT "$(_ref_to_url "$ref")" application/json "$body" >/dev/null
+}
+
+# _load_page REF IF_VERSION CREATE_ONLY — fetch a page once for read-modify-write,
+# populating _PG_{VERSION,TITLE,SYNTAX,CONTENT,PARENT}. Aborts if the page is missing,
+# if --create-only was given (page exists), or if --if-version doesn't match. One GET
+# serves the existence check, the guard, and the field read (vs. three separate GETs).
+_load_page() {
+  local ref="$1" if_version="$2" create_only="$3" pj
+  pj=$(_page_json "$ref")
+  _PG_VERSION=$(printf '%s' "$pj" | jq -r '.version // empty')
+  if [[ "$create_only" == true && -n "$_PG_VERSION" ]]; then
+    echo "xw: --create-only: page $ref already exists (aborting)" >&2; exit 1
+  fi
+  if [[ -z "$_PG_VERSION" ]]; then
+    echo "xw: page $ref does not exist — create it with 'xw put' first" >&2; exit 1
+  fi
+  if [[ -n "$if_version" && "$_PG_VERSION" != "$if_version" ]]; then
+    echo "xw: --if-version $if_version: page $ref is at version $_PG_VERSION (aborting)" >&2; exit 1
+  fi
+  _PG_TITLE=$(printf '%s' "$pj"   | jq -r '.title // ""')
+  _PG_SYNTAX=$(printf '%s' "$pj"  | jq -r '.syntax // "xwiki/2.1"')
+  _PG_PARENT=$(printf '%s' "$pj"  | jq -r '.parent // ""')
+  _PG_CONTENT=$(printf '%s' "$pj" | jq -r '.content // ""')
+}
+
+# _stdin_content — echo piped stdin; return 1 (with no output) if stdin is a tty.
+# Lets callers share one "content came from a pipe, else it's a usage error" line.
+_stdin_content() { [[ -t 0 ]] && return 1; cat; }
+
+# _rev_content REF VERSION — content of a specific page revision.
+_rev_content() { _rest "$(_ref_to_url "$1")/history/$(_urlencode "$2")" | jq -r '.content // ""'; }
+
+# _mime FILE — best-effort MIME type via python3 (matches the repo's existing python3 dependency).
+_mime() {
+  python3 -c 'import mimetypes,sys; print(mimetypes.guess_type(sys.argv[1])[0] or "application/octet-stream")' "$1"
+}
+
+# _docref_xml REF — XStream-serialized DocumentReference for the refactoring jobs API.
+# Parents are tagged with their concrete class (SpaceReference/WikiReference) so XStream
+# rebuilds typed references (a plain EntityReference parent fails an internal WikiReference cast).
+_docref_xml() {
+  python3 - "$XWIKI_WIKI" "$1" <<'PY'
+import sys
+wiki, ref = sys.argv[1], sys.argv[2]
+parts = ref.split('.')
+doc, spaces = parts[-1], parts[:-1]
+def esc(s): return s.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+inner = ('<parent class="org.xwiki.model.reference.WikiReference">'
+         f'<name>{esc(wiki)}</name><type>WIKI</type></parent>')
+for sp in spaces:  # outermost space first; each wraps the previous → deepest space is doc's parent
+    inner = ('<parent class="org.xwiki.model.reference.SpaceReference">'
+             f'<name>{esc(sp)}</name>{inner}<type>SPACE</type></parent>')
+print('<org.xwiki.model.reference.DocumentReference>'
+      f'<name>{esc(doc)}</name>{inner}<type>DOCUMENT</type>'
+      '</org.xwiki.model.reference.DocumentReference>')
+PY
+}
 
 # ---------------------------------------------------------------------------
 # Commands
@@ -165,7 +269,19 @@ cmd_ls() {
 }
 
 cmd_cat() {
-  local ref; ref=$(_normalize_ref "$1")
+  local ref="" version=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --version) version="$2"; shift 2 ;;
+      *)         ref="$1";     shift ;;
+    esac
+  done
+  ref=$(_normalize_ref "$ref")
+  # --version: fetch a historical revision's content via REST (bypasses cache + MCP).
+  if [[ -n "$version" ]]; then
+    _rev_content "$ref" "$version"
+    return
+  fi
   if _cache_hit "$ref"; then
     cat "$(_cache_path "$ref")"
   else
@@ -419,30 +535,384 @@ cmd_put() {
   local ref="${1:-}"; shift || true
   if [[ -z "$ref" ]]; then echo "xw put: usage: put <ref> [--title T] [--syntax S] (--content C | --file F | -)" >&2; exit 1; fi
   ref=$(_normalize_ref "$ref")
-  local title="" syntax="xwiki/2.1" content="" have_content=false
+  local title="" syntax="xwiki/2.1" content="" parent="" have_content=false
+  local if_version="" create_only=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --title)   title="$2";   shift 2 ;;
-      --syntax)  syntax="$2";  shift 2 ;;
-      --content) content="$2"; have_content=true; shift 2 ;;
-      --file)    content="$(cat "$2")"; have_content=true; shift 2 ;;
-      -)         content="$(cat)"; have_content=true; shift ;;
+      --title)       title="$2";   shift 2 ;;
+      --syntax)      syntax="$2";  shift 2 ;;
+      --content)     content="$2"; have_content=true; shift 2 ;;
+      --file)        content="$(cat "$2")"; have_content=true; shift 2 ;;
+      --parent)      parent="$(_normalize_ref "$2")"; shift 2 ;;
+      --if-version)  if_version="$2"; shift 2 ;;
+      --create-only) create_only=true; shift ;;
+      -)             content="$(cat)"; have_content=true; shift ;;
       *) echo "xw put: unknown flag $1" >&2; exit 1 ;;
     esac
   done
-  if ! $have_content; then
-    if [[ ! -t 0 ]]; then
-      content="$(cat)"
-    else
-      echo "xw put: no content — pass --content, --file, or pipe via '-'" >&2; exit 1
-    fi
-  fi
-  local body
-  body=$(jq -nc --arg t "$title" --arg s "$syntax" --arg c "$content" \
-    '{syntax:$s,content:$c} | if $t!="" then .+{title:$t} else . end')
-  _restwrite PUT "$(_ref_to_url "$ref")" application/json "$body" >/dev/null
+  $have_content || content="$(_stdin_content)" || { echo "xw put: no content — pass --content, --file, or pipe via '-'" >&2; exit 1; }
+  _precond "$ref" "$if_version" "$create_only"
+  _write_page "$ref" "$title" "$syntax" "$content" "$parent"
   _cache_evict "$ref"
   echo "updated: $ref" >&2
+}
+
+# Shared read-modify-write for the in-place content editors (append/section/edit).
+# Loads the current page once (existence + guards), runs MUTATOR on its content
+# (stdin→stdout), and re-PUTs preserving title/syntax/parent. MUTATOR reads the
+# current content on stdin and writes the new content on stdout; a non-zero exit
+# aborts the write.
+_edit_page() {
+  local ref="$1" if_version="$2" create_only="$3"; shift 3  # "$@" is the mutator command
+  _load_page "$ref" "$if_version" "$create_only"
+  local new
+  new=$(printf '%s' "$_PG_CONTENT" | "$@") || exit $?
+  _write_page "$ref" "$_PG_TITLE" "$_PG_SYNTAX" "$new" "$_PG_PARENT"
+  _cache_evict "$ref"
+}
+
+cmd_append() {
+  local ref="${1:-}"; shift || true
+  if [[ -z "$ref" ]]; then echo "xw append: usage: append <ref> (--content C | --file F | -)" >&2; exit 1; fi
+  ref=$(_normalize_ref "$ref")
+  local add="" have=false if_version="" create_only=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --content)     add="$2"; have=true; shift 2 ;;
+      --file)        add="$(cat "$2")"; have=true; shift 2 ;;
+      --if-version)  if_version="$2"; shift 2 ;;
+      --create-only) create_only=true; shift ;;
+      -)             add="$(cat)"; have=true; shift ;;
+      *) echo "xw append: unknown flag $1" >&2; exit 1 ;;
+    esac
+  done
+  $have || add="$(_stdin_content)" || { echo "xw append: no content — pass --content, --file, or pipe via '-'" >&2; exit 1; }
+  ADD="$add" _edit_page "$ref" "$if_version" "$create_only" \
+    python3 -c 'import os,sys; c=sys.stdin.read(); sys.stdout.write(c+("\n" if c and not c.endswith("\n") else "")+os.environ["ADD"])'
+  echo "appended: $ref" >&2
+}
+
+cmd_section() {
+  local sub="${1:-}"; shift || true
+  if [[ "$sub" != set ]]; then echo "xw section: usage: section set <ref> <heading> (--content C | --file F | -)" >&2; exit 1; fi
+  local ref="${1:-}" heading="${2:-}"
+  if [[ -z "$ref" || -z "$heading" ]]; then echo "xw section set: usage: section set <ref> <heading> (--content C | --file F | -)" >&2; exit 1; fi
+  shift 2
+  ref=$(_normalize_ref "$ref")
+  local body="" have=false if_version="" create_only=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --content)     body="$2"; have=true; shift 2 ;;
+      --file)        body="$(cat "$2")"; have=true; shift 2 ;;
+      --if-version)  if_version="$2"; shift 2 ;;
+      --create-only) create_only=true; shift ;;
+      -)             body="$(cat)"; have=true; shift ;;
+      *) echo "xw section set: unknown flag $1" >&2; exit 1 ;;
+    esac
+  done
+  $have || body="$(_stdin_content)" || { echo "xw section set: no content — pass --content, --file, or pipe via '-'" >&2; exit 1; }
+  XW_HEADING="$heading" XW_BODY="$body" _edit_page "$ref" "$if_version" "$create_only" python3 -c '
+import os, re, sys
+content = sys.stdin.read()
+heading = os.environ["XW_HEADING"].strip()
+newbody = os.environ["XW_BODY"]
+lines = content.split("\n")
+hre = re.compile(r"^(={1,6})\s*(.*?)\s*=*\s*$")
+start = level = None
+for i, l in enumerate(lines):
+    m = hre.match(l)
+    if m and m.group(2).strip() == heading:
+        start, level = i, len(m.group(1)); break
+if start is None:
+    sys.stderr.write("xw section set: heading %r not found\n" % heading); sys.exit(2)
+end = len(lines)
+for j in range(start + 1, len(lines)):
+    m = hre.match(lines[j])
+    if m and len(m.group(1)) <= level:
+        end = j; break
+out = lines[:start + 1] + [""] + newbody.split("\n")
+if end < len(lines):
+    out += [""] + lines[end:]
+sys.stdout.write("\n".join(out))
+'
+  echo "section set: $ref [$heading]" >&2
+}
+
+cmd_edit() {
+  local ref="${1:-}"; shift || true
+  if [[ -z "$ref" ]]; then echo "xw edit: usage: edit <ref> --replace OLD --with NEW [--first]" >&2; exit 1; fi
+  ref=$(_normalize_ref "$ref")
+  local old="" new="" first=false have_old=false have_new=false if_version="" create_only=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --replace)     old="$2"; have_old=true; shift 2 ;;
+      --with)        new="$2"; have_new=true; shift 2 ;;
+      --first)       first=true; shift ;;
+      --if-version)  if_version="$2"; shift 2 ;;
+      --create-only) create_only=true; shift ;;
+      *) echo "xw edit: unknown flag $1" >&2; exit 1 ;;
+    esac
+  done
+  if ! $have_old || ! $have_new; then
+    echo "xw edit: need --replace OLD and --with NEW" >&2; exit 1
+  fi
+  XW_OLD="$old" XW_NEW="$new" XW_FIRST="$first" \
+    _edit_page "$ref" "$if_version" "$create_only" python3 -c '
+import os, sys
+content = sys.stdin.read()
+old, new = os.environ["XW_OLD"], os.environ["XW_NEW"]
+n = content.count(old)
+if n == 0:
+    sys.stderr.write("xw edit: no match for %r (aborting)\n" % old); sys.exit(2)
+if os.environ["XW_FIRST"] == "true":
+    content = content.replace(old, new, 1); cnt = 1
+else:
+    content = content.replace(old, new); cnt = n
+sys.stderr.write("xw edit: replaced %d occurrence(s)\n" % cnt)
+sys.stdout.write(content)
+'
+  echo "edited: $ref" >&2
+}
+
+cmd_meta() {
+  local sub="${1:-}"; shift || true
+  if [[ "$sub" != set ]]; then echo "xw meta: usage: meta set <ref> [--parent P] [--title T]" >&2; exit 1; fi
+  local ref="${1:-}"; shift || true
+  if [[ -z "$ref" ]]; then echo "xw meta set: usage: meta set <ref> [--parent P] [--title T]" >&2; exit 1; fi
+  ref=$(_normalize_ref "$ref")
+  local parent="" title="" have_parent=false have_title=false if_version="" create_only=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --parent)      parent="$(_normalize_ref "$2")"; have_parent=true; shift 2 ;;
+      --title)       title="$2"; have_title=true; shift 2 ;;
+      --if-version)  if_version="$2"; shift 2 ;;
+      --create-only) create_only=true; shift ;;
+      *) echo "xw meta set: unknown flag $1" >&2; exit 1 ;;
+    esac
+  done
+  if ! $have_parent && ! $have_title; then
+    echo "xw meta set: nothing to change — pass --parent and/or --title" >&2; exit 1
+  fi
+  # Read-modify-write: resend current content/syntax unchanged; only parent/title move.
+  _load_page "$ref" "$if_version" "$create_only"
+  $have_title  || title="$_PG_TITLE"
+  $have_parent || parent="$_PG_PARENT"
+  _write_page "$ref" "$title" "$_PG_SYNTAX" "$_PG_CONTENT" "$parent"
+  _cache_evict "$ref"
+  echo "meta set: $ref${have_parent:+ parent=$parent}" >&2
+}
+
+cmd_rm() {
+  local ref="${1:-}"; shift || true
+  if [[ -z "$ref" ]]; then echo "xw rm: usage: rm <ref> [--purge]" >&2; exit 1; fi
+  ref=$(_normalize_ref "$ref")
+  local purge=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --purge) purge=true; shift ;;
+      *) echo "xw rm: unknown flag $1" >&2; exit 1 ;;
+    esac
+  done
+  local path; path="$(_ref_to_url "$ref")"
+  $purge && path="$path?skipRecycleBin=true"
+  _restdel "$path"
+  _cache_evict "$ref"
+  echo "removed: $ref${purge:+ (purged)}" >&2
+}
+
+cmd_tag() {
+  local sub="${1:-}"; shift || true
+  local ref="${1:-}"; shift || true
+  if [[ -z "$ref" ]]; then echo "xw tag: usage: tag {ls|add|rm|set} <ref> [tag ...]" >&2; exit 1; fi
+  ref=$(_normalize_ref "$ref")
+  local base; base="$(_ref_to_url "$ref")"
+  case "$sub" in
+    ls)
+      _rest "$base/tags" | jq -r '.tags[]?.name'
+      ;;
+    add|rm|set)
+      (( $# )) || { echo "xw tag $sub: need at least one tag" >&2; exit 1; }
+      local cur names
+      cur=$(_rest "$base/tags" | jq -c '[.tags[]?.name]')
+      case "$sub" in
+        add) names=$(jq -nc --argjson cur "$cur" '$cur + $ARGS.positional | unique' --args "$@") ;;
+        rm)  names=$(jq -nc --argjson cur "$cur" '$cur - $ARGS.positional' --args "$@") ;;
+        set) names=$(jq -nc '$ARGS.positional | unique' --args "$@") ;;
+      esac
+      local body
+      body=$(jq -nc --argjson n "$names" '{tags: [$n[] | {name: .}]}')
+      _restwrite PUT "$base/tags" application/json "$body" >/dev/null
+      _cache_evict "$ref"
+      echo "tags $sub: $ref -> $(printf '%s' "$names" | jq -r 'join(", ")')" >&2
+      ;;
+    *)
+      echo "xw tag: {ls|add|rm|set} <ref> [tag ...]" >&2; exit 1
+      ;;
+  esac
+}
+
+cmd_log() {
+  local ref="${1:-}"; shift || true
+  if [[ -z "$ref" ]]; then echo "xw log: usage: log <ref> [-n N]" >&2; exit 1; fi
+  ref=$(_normalize_ref "$ref")
+  local n=0
+  [[ "${1:-}" == "-n" ]] && { n="$2"; shift 2; }
+  _rest "$(_ref_to_url "$ref")/history" | jq -r --argjson n "$n" '
+    [.historySummaries[]?]
+    | (if $n > 0 then .[0:$n] else . end)[]
+    | [ .version,
+        (if .modified then (.modified/1000 | strftime("%Y-%m-%d")) else "-" end),
+        ((.modifier // "?") | split(".") | last),
+        (.comment // "") ]
+    | @tsv'
+}
+
+cmd_diff() {
+  local ref="${1:-}" v1="${2:-}" v2="${3:-}"
+  if [[ -z "$ref" || -z "$v1" || -z "$v2" ]]; then
+    echo "xw diff: usage: diff <ref> <v1> <v2>" >&2; exit 1
+  fi
+  ref=$(_normalize_ref "$ref")
+  local d; d=$(mktemp -d "${TMPDIR:-/tmp}/xw-diff.XXXXXX")
+  _rev_content "$ref" "$v1" > "$d/a"
+  _rev_content "$ref" "$v2" > "$d/b"
+  diff -u -L "$ref@$v1" "$d/a" -L "$ref@$v2" "$d/b"
+  local rc=$?
+  rm -rf "$d"
+  return "$rc"
+}
+
+cmd_backlinks() {
+  local refonly=false
+  [[ "${1:-}" == "-l" ]] && { refonly=true; shift; }
+  local ref="${1:-}"; shift || true
+  [[ "${1:-}" == "-l" ]] && { refonly=true; shift; }
+  if [[ -z "$ref" ]]; then echo "xw backlinks: usage: backlinks <ref> [-l]" >&2; exit 1; fi
+  ref=$(_normalize_ref "$ref")
+  # Solr indexes links as: entity:document:<wiki>:<Space.Page> (verified live on aster).
+  local out
+  out=$(_restq "/query" \
+    --data-urlencode "q=links:\"entity:document:$XWIKI_WIKI:$ref\"" \
+    --data-urlencode "type=solr" \
+    --data-urlencode "fq=wiki:$XWIKI_WIKI" \
+    --data-urlencode "number=50")
+  if $refonly; then
+    printf '%s' "$out" | jq -r '.searchResults[]?.pageFullName'
+  else
+    printf '%s' "$out" | jq -r '.searchResults[]? | "\(.score)\t\(.pageFullName)\t\(.title)"'
+  fi
+}
+
+cmd_links() {
+  local ref="${1:-}"; shift || true
+  if [[ -z "$ref" ]]; then echo "xw links: usage: links <ref>" >&2; exit 1; fi
+  ref=$(_normalize_ref "$ref")
+  # Outbound links: parse [[...]] targets from raw page content. Best-effort, syntax-dependent.
+  _page_json "$ref" | jq -r '.content // ""' | python3 -c '
+import re, sys
+content = sys.stdin.read()
+seen = []
+for m in re.finditer(r"\[\[(.*?)\]\]", content, re.S):
+    t = m.group(1)
+    if ">>" in t:            # [[label>>target]]
+        t = t.split(">>", 1)[1]
+    t = t.split("||", 1)[0]  # drop parameters
+    t = t.strip()
+    if t.lower().startswith("doc:"):
+        t = t[4:]
+    t = t.split("#", 1)[0].strip()  # drop anchor
+    if not t:
+        continue
+    if t.lower().split(":", 1)[0] in ("http", "https", "mailto", "attach", "image", "url", "path"):
+        continue
+    if t not in seen:
+        seen.append(t)
+for t in seen:
+    print(t)
+'
+}
+
+cmd_attach() {
+  local sub="${1:-}"; shift || true
+  local ref="${1:-}"; shift || true
+  if [[ -z "$ref" ]]; then echo "xw attach: usage: attach {ls|put|get|rm} <ref> ..." >&2; exit 1; fi
+  ref=$(_normalize_ref "$ref")
+  local base; base="$(_ref_to_url "$ref")"
+  case "$sub" in
+    ls)
+      _rest "$base/attachments" | jq -r '.attachments[]? | "\(.name)\t\(.mimeType)\t\(.size)"'
+      ;;
+    put)
+      local file="${1:-}"; shift || true
+      [[ -z "$file" ]] && { echo "xw attach put: usage: attach put <ref> <file> [--name N]" >&2; exit 1; }
+      [[ -f "$file" ]] || { echo "xw attach put: no such file: $file" >&2; exit 1; }
+      local name; name="$(basename "$file")"
+      [[ "${1:-}" == "--name" ]] && { name="$2"; shift 2; }
+      _restwrite_bin PUT "$base/attachments/$(_urlencode "$name")" "$(_mime "$file")" "$file" >/dev/null
+      _cache_evict "$ref"
+      echo "attached: $ref -> $name" >&2
+      ;;
+    get)
+      local name="${1:-}"; shift || true
+      [[ -z "$name" ]] && { echo "xw attach get: usage: attach get <ref> <name> [-o OUT]" >&2; exit 1; }
+      local out=""
+      [[ "${1:-}" == "-o" ]] && { out="$2"; shift 2; }
+      # Raw binary download — can't use _rest (it forces Accept: application/json).
+      local url="$REST_BASE$base/attachments/$(_urlencode "$name")"
+      if [[ -n "$out" ]]; then
+        curl -s "${_AUTH[@]}" "$url" -o "$out"; echo "saved: $out" >&2
+      else
+        curl -s "${_AUTH[@]}" "$url"
+      fi
+      ;;
+    rm)
+      local name="${1:-}"; shift || true
+      [[ -z "$name" ]] && { echo "xw attach rm: usage: attach rm <ref> <name>" >&2; exit 1; }
+      _restdel "$base/attachments/$(_urlencode "$name")"
+      _cache_evict "$ref"
+      echo "removed attachment: $ref -> $name" >&2
+      ;;
+    *)
+      echo "xw attach: {ls|put|get|rm} <ref> ..." >&2; exit 1
+      ;;
+  esac
+}
+
+cmd_mv() {
+  local src="${1:-}" dst="${2:-}"
+  if [[ -z "$src" || -z "$dst" ]]; then echo "xw mv: usage: mv <src> <dst>" >&2; exit 1; fi
+  src=$(_normalize_ref "$src"); dst=$(_normalize_ref "$dst")
+  if ! _page_exists "$src"; then echo "xw mv: source $src does not exist" >&2; exit 1; fi
+  local jobid="xw-$$-$(date +%s)"
+  local body
+  body="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<jobRequest xmlns=\"http://www.xwiki.org\">
+  <id><element>refactoring</element><element>$jobid</element></id>
+  <interactive>false</interactive><remote>false</remote><verbose>false</verbose>
+  <property><key>checkrights</key><value><boolean>false</boolean></value></property>
+  <property><key>autoRedirect</key><value><boolean>false</boolean></value></property>
+  <property><key>entityReferences</key><value><list>$(_docref_xml "$src")</list></value></property>
+  <property><key>destination</key><value>$(_docref_xml "$dst")</value></property>
+</jobRequest>"
+  # rename handles both same-space rename and cross-space move (destination = full doc ref).
+  _restroot PUT "/jobs?jobType=refactoring/rename&async=true" application/xml "$body" >/dev/null
+  # Poll the async job to completion (bounded).
+  local state="" i
+  for ((i=0; i<60; i++)); do
+    state=$(curl -s "${_AUTH[@]}" "https://$XWIKI_HOST/rest/jobstatus/refactoring/$jobid" \
+      -H "Accept: application/json" | jq -r '.state // "?"')
+    [[ "$state" == FINISHED ]] && break
+    sleep 1
+  done
+  _cache_evict "$src"; _cache_evict "$dst"
+  if [[ "$state" != FINISHED ]]; then
+    echo "xw mv: job did not finish (last state: $state)" >&2; exit 1
+  fi
+  if _page_exists "$dst"; then
+    echo "moved: $src -> $dst" >&2
+  else
+    echo "xw mv: job finished but $dst not found — check rights/source" >&2; exit 1
+  fi
 }
 
 cmd_obj() {
@@ -515,8 +985,32 @@ cmd_obj() {
       _cache_evict "$ref"
       echo "set: $ref $class[$number]" >&2
       ;;
+    rm)
+      local ref="${1:-}"; shift || true
+      [[ -z "$ref" ]] && { echo "xw obj rm: usage: obj rm <ref> [--class C] [--number N]" >&2; exit 1; }
+      ref=$(_normalize_ref "$ref")
+      local class="$XWIKI_OBJECT_CLASS" number=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --class)  class="$2";  shift 2 ;;
+          --number) number="$2"; shift 2 ;;
+          *) echo "xw obj rm: unknown flag $1" >&2; exit 1 ;;
+        esac
+      done
+      [[ -z "$class" ]] && { echo "xw obj rm: set --class or XWIKI_OBJECT_CLASS (e.g. MySpace.Code.MyClass)" >&2; exit 1; }
+      local base; base="$(_ref_to_url "$ref")"
+      # Resolve number the same way 'obj set' does when omitted.
+      if [[ -z "$number" ]]; then
+        number=$(_rest "$base/objects" \
+          | jq -r --arg c "$class" 'first(.objectSummaries[] | select(.className==$c) | .number) // empty')
+        [[ -z "$number" ]] && { echo "xw obj rm: no object of class $class on $ref" >&2; exit 1; }
+      fi
+      _restdel "$base/objects/$(_urlencode "$class")/$number"
+      _cache_evict "$ref"
+      echo "removed obj: $ref $class[$number]" >&2
+      ;;
     *)
-      echo "xw obj: {set|ls|get} <ref> ..." >&2; exit 1
+      echo "xw obj: {set|ls|get|rm} <ref> ..." >&2; exit 1
       ;;
   esac
 }
@@ -536,18 +1030,30 @@ case "$cmd" in
   wc)      cmd_wc      "$@" ;;
   search)  cmd_search  "$@" ;;
   find)    cmd_find    "$@" ;;
-  grep)    cmd_grep    "$@" ;;
-  put)     cmd_put     "$@" ;;
-  obj)     cmd_obj     "$@" ;;
-  cache)   cmd_cache   "$@" ;;
-  man)     cmd_man     "$@" ;;
+  grep)      cmd_grep      "$@" ;;
+  put)       cmd_put       "$@" ;;
+  append)    cmd_append    "$@" ;;
+  section)   cmd_section   "$@" ;;
+  edit)      cmd_edit      "$@" ;;
+  meta)      cmd_meta      "$@" ;;
+  rm)        cmd_rm        "$@" ;;
+  mv)        cmd_mv        "$@" ;;
+  tag)       cmd_tag       "$@" ;;
+  obj)       cmd_obj       "$@" ;;
+  log)       cmd_log       "$@" ;;
+  diff)      cmd_diff      "$@" ;;
+  backlinks) cmd_backlinks "$@" ;;
+  links)     cmd_links     "$@" ;;
+  attach)    cmd_attach    "$@" ;;
+  cache)     cmd_cache     "$@" ;;
+  man)       cmd_man       "$@" ;;
   ""|help|--help|-h)
     cat >&2 <<'HELP'
 xw — XWiki shell helper
 
 Read:
   ls [-l] [space]                list spaces / sub-spaces; -l adds modified date, version, author
-  cat <ref>                      full page (metadata header + numbered content)
+  cat <ref> [--version V]        full page (metadata header + numbered content); --version reads a revision
   head [-n N] <ref>              first N lines (default 20)
   tail [-n N] <ref>              last N lines  (default 20)
   range <ref> <start> <end>      line range (1-based)
@@ -560,13 +1066,46 @@ Search:
   grep [-l] <pattern> [--space S] [--field F]
 
 Write:  (mutates the wiki)
-  put <ref> [--title T] [--syntax S] (--content C | --file F | -)
+  put <ref> [--title T] [--syntax S] [--parent P] (--content C | --file F | -)
                                  create/update a page (idempotent PUT)
+  append <ref> (--content C | --file F | -)
+                                 append text to a page's content
+  section set <ref> <heading> (--content C | --file F | -)
+                                 replace the body under a matching xwiki/2.1 heading
+  edit <ref> --replace OLD --with NEW [--first]
+                                 literal (non-regex) substitution; default all, --first for one
+  meta set <ref> [--parent P] [--title T]
+                                 change parent/title without touching content
+  rm <ref> [--purge]             delete a page (recycle bin; --purge skips it). Single doc only.
+  mv <src> <dst>                 rename/move a page (async refactoring job; source removed)
+  tag {ls|add|rm|set} <ref> [tag ...]
+                                 list / add / remove / replace a page's tags
   obj ls <ref>                   list XObjects attached to a page
   obj get <ref> [--class C] [--number N]
                                  print an object's properties (key=value)
   obj set <ref> [--class C] [--number N] key=value ...
                                  create/update an AWM/XObject record (page must exist)
+  obj rm <ref> [--class C] [--number N]
+                                 delete an XObject record
+
+  Guards (opt-in; default is last-write-wins) on put/append/section/edit/meta:
+    --if-version N               abort unless the page is at version N (best-effort)
+    --create-only                abort if the page already exists
+
+History:
+  log <ref> [-n N]               revision history (version, date, author, comment)
+  cat <ref> --version V          content of a specific revision
+  diff <ref> <v1> <v2>           unified diff between two revisions
+
+Links:
+  backlinks <ref> [-l]           pages linking to <ref> (Solr); -l for refs only
+  links <ref>                    outbound [[...]] doc links from a page (best-effort)
+
+Attach:
+  attach ls <ref>                list attachments (name, mimeType, size)
+  attach put <ref> <file> [--name N]   upload an attachment
+  attach get <ref> <name> [-o OUT]     download an attachment (stdout or -o file)
+  attach rm <ref> <name>         delete an attachment
 
 Cache:
   cache add <ref>                fetch and cache a page
