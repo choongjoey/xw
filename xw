@@ -69,11 +69,17 @@ _restq() { local p="$1"; shift; curl -s "${_AUTH[@]}" -G "$REST_BASE$p" "$@" -H 
 # Parse "Size: N lines · ..." → N
 _size_lines() { awk '/^Size:/{print $2; exit}'; }
 
-# Fetch XWiki's CSRF form token (some instances require it on form POST/PUT).
-# Returns the value of the XWiki-Form-Token response header, or empty.
+# Normalize ref: strip leading wiki: prefix so cache keys and REST paths are consistent.
+_normalize_ref() { printf '%s' "${1#*:}"; }
+
+# Fetch XWiki's CSRF form token (cached for the life of the script).
+_FORM_TOKEN=''
 _form_token() {
-  curl -s "${_AUTH[@]}" -I "$REST_BASE" \
-    | awk 'BEGIN{IGNORECASE=1} /^XWiki-Form-Token:/{sub(/\r$/,""); print $2; exit}'
+  if [[ -z "$_FORM_TOKEN" ]]; then
+    _FORM_TOKEN=$(curl -s "${_AUTH[@]}" -I "$REST_BASE" \
+      | awk 'BEGIN{IGNORECASE=1} /^XWiki-Form-Token:/{sub(/\r$/,""); print $2; exit}')
+  fi
+  printf '%s' "$_FORM_TOKEN"
 }
 
 # _restwrite METHOD PATH CONTENT_TYPE BODY — write transport.
@@ -114,19 +120,52 @@ _cache_evict() { rm -f "$(_cache_path "$1")"; }
 # ---------------------------------------------------------------------------
 
 cmd_ls() {
-  local space="${1:-}"
-  if [[ -z "$space" ]]; then
-    _rest "/spaces" | jq -r \
-      '.spaces[] | select(.id | split(":")[1] | contains(".") | not) | .name'
-  else
-    local wiki="$XWIKI_WIKI"
-    _rest "/spaces" | jq -r --arg w "$wiki" --arg s "$space" \
-      '.spaces[] | select(.id | test("^"+$w+":"+$s+"\\.[^.]+$")) | (.id | split(":")[1]) + ".WebHome"'
+  local long=false space=""
+  [[ "${1:-}" == "-l" ]] && { long=true; shift; }
+  space="${1:-}"
+
+  if ! $long; then
+    if [[ -z "$space" ]]; then
+      _rest "/spaces" | jq -r \
+        '.spaces[] | select(.id | split(":")[1] | contains(".") | not) | .name'
+    else
+      local wiki="$XWIKI_WIKI"
+      _rest "/spaces" | jq -r --arg w "$wiki" --arg s "$space" \
+        '.spaces[] | select(.id | test("^"+$w+":"+$s+"\\.[^.]+$")) | (.id | split(":")[1]) + ".WebHome"'
+    fi
+    return
   fi
+
+  # -l: one XWQL call returns WebHome pages with metadata; filter in jq
+  local q jq_select sp_esc="${space//\'/\'\'}"
+  if [[ -z "$space" ]]; then
+    q="where doc.name = 'WebHome'"
+    jq_select='select(.space | test("^[^.]+$"))'
+  else
+    q="where doc.name = 'WebHome' and doc.space like '${sp_esc}.%'"
+    jq_select='select(.space | startswith($s+"."))'
+  fi
+  local results
+  results=$(_restq "/query" \
+    --data-urlencode "q=$q" \
+    --data-urlencode "type=xwql" \
+    --data-urlencode "number=500")
+
+  printf '%s' "$results" | jq -r --arg s "$space" "
+    [ .searchResults[] | $jq_select ]
+    | unique_by(.pageFullName)
+    | sort_by(.modified) | reverse[]
+    | [
+        (if .modified then (.modified/1000 | strftime(\"%Y-%m-%d\")) else \"-\" end),
+        \"v\" + (.version // \"?\"),
+        ((.author // \"?\") | split(\".\") | last),
+        .pageFullName
+      ]
+    | @tsv"
 }
 
 cmd_cat() {
-  local ref="$1"
+  local ref; ref=$(_normalize_ref "$1")
   if _cache_hit "$ref"; then
     cat "$(_cache_path "$ref")"
   else
@@ -138,13 +177,8 @@ cmd_cat() {
   local base obj_resp obj_lines
   base="$(_ref_to_url "$ref")"
   obj_resp=$(_rest "$base/objects" 2>/dev/null)
-  if [[ -n "$XWIKI_OBJECT_CLASS" ]]; then
-    obj_lines=$(printf '%s' "$obj_resp" | jq -r --arg c "$XWIKI_OBJECT_CLASS" \
-      '.objectSummaries[]? | select(.className == $c) | "\(.className)\t\(.number)"' 2>/dev/null)
-  else
-    obj_lines=$(printf '%s' "$obj_resp" | jq -r \
-      '.objectSummaries[]? | select(.className | startswith("XWiki.") | not) | "\(.className)\t\(.number)"' 2>/dev/null)
-  fi
+  obj_lines=$(printf '%s' "$obj_resp" | jq -r --arg c "$XWIKI_OBJECT_CLASS" \
+    '.objectSummaries[]? | select(if $c != "" then .className == $c else (.className | startswith("XWiki.") | not) end) | "\(.className)\t\(.number)"' 2>/dev/null)
   if [[ -n "$obj_lines" ]]; then
     echo ""
     while IFS=$'\t' read -r class number; do
@@ -357,7 +391,7 @@ cmd_cache() {
       ;;
     rm)
       local path; path=$(_cache_path "$1")
-      rm -f "$path" && echo "removed: $path"
+      _cache_evict "$1" && echo "removed: $path"
       ;;
     clear)
       find "$XW_CACHE_DIR" -maxdepth 1 -name '*.txt' -delete 2>/dev/null
@@ -384,19 +418,20 @@ cmd_man() {
 cmd_put() {
   local ref="${1:-}"; shift || true
   if [[ -z "$ref" ]]; then echo "xw put: usage: put <ref> [--title T] [--syntax S] (--content C | --file F | -)" >&2; exit 1; fi
-  local title="" syntax="xwiki/2.1" content="" have_content=false use_stdin=false
+  ref=$(_normalize_ref "$ref")
+  local title="" syntax="xwiki/2.1" content="" have_content=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --title)   title="$2";   shift 2 ;;
       --syntax)  syntax="$2";  shift 2 ;;
       --content) content="$2"; have_content=true; shift 2 ;;
       --file)    content="$(cat "$2")"; have_content=true; shift 2 ;;
-      -)         use_stdin=true; shift ;;
+      -)         content="$(cat)"; have_content=true; shift ;;
       *) echo "xw put: unknown flag $1" >&2; exit 1 ;;
     esac
   done
   if ! $have_content; then
-    if $use_stdin || [[ ! -t 0 ]]; then
+    if [[ ! -t 0 ]]; then
       content="$(cat)"
     else
       echo "xw put: no content — pass --content, --file, or pipe via '-'" >&2; exit 1
@@ -437,20 +472,18 @@ cmd_obj() {
     set)
       local ref="${1:-}"; shift || true
       [[ -z "$ref" ]] && { echo "xw obj set: usage: obj set <ref> [--class C] [--number N] key=value ..." >&2; exit 1; }
-      local class="$XWIKI_OBJECT_CLASS" number="" have_number=false pairs=()
+      ref=$(_normalize_ref "$ref")
+      local class="$XWIKI_OBJECT_CLASS" number="" pairs=()
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --class)  class="$2";  shift 2 ;;
-          --number) number="$2"; have_number=true; shift 2 ;;
+          --number) number="$2"; shift 2 ;;
           -*) echo "xw obj set: unknown flag $1" >&2; exit 1 ;;
           *)  pairs+=("$1"); shift ;;
         esac
       done
       [[ -z "$class" ]] && { echo "xw obj set: set --class or XWIKI_OBJECT_CLASS (e.g. MySpace.Code.MyClass)" >&2; exit 1; }
       (( ${#pairs[@]} )) || { echo "xw obj set: need at least one key=value" >&2; exit 1; }
-      if ! _page_exists "$ref"; then
-        echo "xw obj set: page $ref does not exist; create it first with 'xw put'" >&2; exit 1
-      fi
       # Build property#<key>=<encoded value> body from key=value args.
       local body="" p key val
       for p in "${pairs[@]}"; do
@@ -460,13 +493,18 @@ cmd_obj() {
       body="${body#&}"
       local base; base="$(_ref_to_url "$ref")"
       local classurl; classurl="$(_urlencode "$class")"
-      # Update if --number given or an object of this class already exists; else create.
-      if ! $have_number; then
-        number=$(_rest "$base/objects" \
-          | jq -r --arg c "$class" 'first(.objectSummaries[] | select(.className==$c) | .number) // empty')
-        [[ -n "$number" ]] && have_number=true
+      # Probe existing objects; a 404/empty body means the page doesn't exist.
+      local obj_list
+      obj_list=$(_rest "$base/objects" 2>/dev/null)
+      if [[ -z "$(printf '%s' "$obj_list" | jq -r '.objectSummaries? // empty' 2>/dev/null)" ]]; then
+        echo "xw obj set: page $ref does not exist; create it first with 'xw put'" >&2; exit 1
       fi
-      if $have_number; then
+      # Update if --number was given or an object of this class already exists; else create.
+      if [[ -z "$number" ]]; then
+        number=$(printf '%s' "$obj_list" \
+          | jq -r --arg c "$class" 'first(.objectSummaries[] | select(.className==$c) | .number) // empty')
+      fi
+      if [[ -n "$number" ]]; then
         _restwrite PUT "$base/objects/$classurl/$number" \
           application/x-www-form-urlencoded "$body" >/dev/null
       else
@@ -508,7 +546,7 @@ case "$cmd" in
 xw — XWiki shell helper
 
 Read:
-  ls [space]                     list spaces / sub-spaces
+  ls [-l] [space]                list spaces / sub-spaces; -l adds modified date, version, author
   cat <ref>                      full page (metadata header + numbered content)
   head [-n N] <ref>              first N lines (default 20)
   tail [-n N] <ref>              last N lines  (default 20)
